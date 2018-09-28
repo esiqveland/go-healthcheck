@@ -32,19 +32,24 @@ func NewRegistry() *Registry {
 // the registry used by the HTTP handler.
 var DefaultRegistry *Registry
 
+type Result struct {
+	Error   error
+	Message string
+}
+
 // Checker is the interface for a Health Checker
 type Checker interface {
 	// Check returns nil if the service is okay.
-	Check() error
+	Check() Result
 }
 
 // CheckFunc is a convenience type to create functions that implement
 // the Checker interface
-type CheckFunc func() error
+type CheckFunc func() Result
 
 // Check Implements the Checker interface to allow for any func() error method
 // to be passed as a Checker
-func (cf CheckFunc) Check() error {
+func (cf CheckFunc) Check() Result {
 	return cf()
 }
 
@@ -53,7 +58,7 @@ type Updater interface {
 	Checker
 
 	// Update updates the current status of the health check.
-	Update(status error)
+	Update(status Result)
 }
 
 // updater implements Checker and Updater, providing an asynchronous Update
@@ -62,11 +67,11 @@ type Updater interface {
 // not blocking on a potentially expensive check.
 type updater struct {
 	mu     sync.Mutex
-	status error
+	status Result
 }
 
 // Check implements the Checker interface
-func (u *updater) Check() error {
+func (u *updater) Check() Result {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -75,7 +80,7 @@ func (u *updater) Check() error {
 
 // Update implements the Updater interface, allowing asynchronous access to
 // the status of a Checker.
-func (u *updater) Update(status error) {
+func (u *updater) Update(status Result) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -85,49 +90,6 @@ func (u *updater) Update(status error) {
 // NewStatusUpdater returns a new updater
 func NewStatusUpdater() Updater {
 	return &updater{}
-}
-
-// thresholdUpdater implements Checker and Updater, providing an asynchronous Update
-// method.
-// This allows us to have a Checker that returns the Check() call immediately
-// not blocking on a potentially expensive check.
-type thresholdUpdater struct {
-	mu        sync.Mutex
-	status    error
-	threshold int
-	count     int
-}
-
-// Check implements the Checker interface
-func (tu *thresholdUpdater) Check() error {
-	tu.mu.Lock()
-	defer tu.mu.Unlock()
-
-	if tu.count >= tu.threshold {
-		return tu.status
-	}
-
-	return nil
-}
-
-// thresholdUpdater implements the Updater interface, allowing asynchronous
-// access to the status of a Checker.
-func (tu *thresholdUpdater) Update(status error) {
-	tu.mu.Lock()
-	defer tu.mu.Unlock()
-
-	if status == nil {
-		tu.count = 0
-	} else if tu.count < tu.threshold {
-		tu.count++
-	}
-
-	tu.status = status
-}
-
-// NewThresholdStatusUpdater returns a new thresholdUpdater
-func NewThresholdStatusUpdater(t int) Updater {
-	return &thresholdUpdater{threshold: t}
 }
 
 // PeriodicChecker wraps an updater to provide a periodic checker
@@ -144,39 +106,36 @@ func PeriodicChecker(check Checker, period time.Duration) Checker {
 	return u
 }
 
-// PeriodicThresholdChecker wraps an updater to provide a periodic checker that
-// uses a threshold before it changes status
-func PeriodicThresholdChecker(check Checker, period time.Duration, threshold int) Checker {
-	tu := NewThresholdStatusUpdater(threshold)
-	go func() {
-		t := time.NewTicker(period)
-		for {
-			<-t.C
-			tu.Update(check.Check())
-		}
-	}()
-
-	return tu
+type HealthCheck struct {
+	Healthy bool   `json:"healthy"`
+	Message string `json:"message"`
 }
 
+type Status map[string]HealthCheck
+
 // CheckStatus returns a map with all the current health check errors
-func (registry *Registry) CheckStatus() map[string]string { // TODO(stevvooe) this needs a proper type
+func (registry *Registry) CheckStatus() Status {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
-	statusKeys := make(map[string]string)
+	status := Status{}
+
 	for k, v := range registry.registeredChecks {
-		err := v.Check()
-		if err != nil {
-			statusKeys[k] = err.Error()
+		res := v.Check()
+
+		healthy := res.Error == nil
+
+		status[k] = HealthCheck{
+			Healthy: healthy,
+			Message: res.Message,
 		}
 	}
 
-	return statusKeys
+	return status
 }
 
-// CheckStatus returns a map with all the current health check errors from the
+// CheckStatus returns a map with all the current health check results from the
 // default registry.
-func CheckStatus() map[string]string {
+func CheckStatus() Status {
 	return DefaultRegistry.CheckStatus()
 }
 
@@ -202,20 +161,20 @@ func Register(name string, check Checker) {
 
 // RegisterFunc allows the convenience of registering a checker directly from
 // an arbitrary func() error.
-func (registry *Registry) RegisterFunc(name string, check func() error) {
-	registry.Register(name, CheckFunc(check))
+func (registry *Registry) RegisterFunc(name string, check CheckFunc) {
+	registry.Register(name, check)
 }
 
 // RegisterFunc allows the convenience of registering a checker in the default
 // registry directly from an arbitrary func() error.
-func RegisterFunc(name string, check func() error) {
+func RegisterFunc(name string, check CheckFunc) {
 	DefaultRegistry.RegisterFunc(name, check)
 }
 
 // RegisterPeriodicFunc allows the convenience of registering a PeriodicChecker
 // from an arbitrary func() error.
 func (registry *Registry) RegisterPeriodicFunc(name string, period time.Duration, check CheckFunc) {
-	registry.Register(name, PeriodicChecker(CheckFunc(check), period))
+	registry.Register(name, PeriodicChecker(check, period))
 }
 
 // RegisterPeriodicFunc allows the convenience of registering a PeriodicChecker
@@ -224,28 +183,22 @@ func RegisterPeriodicFunc(name string, period time.Duration, check CheckFunc) {
 	DefaultRegistry.RegisterPeriodicFunc(name, period, check)
 }
 
-// RegisterPeriodicThresholdFunc allows the convenience of registering a
-// PeriodicChecker from an arbitrary func() error.
-func (registry *Registry) RegisterPeriodicThresholdFunc(name string, period time.Duration, threshold int, check CheckFunc) {
-	registry.Register(name, PeriodicThresholdChecker(CheckFunc(check), period, threshold))
-}
-
-// RegisterPeriodicThresholdFunc allows the convenience of registering a
-// PeriodicChecker in the default registry from an arbitrary func() error.
-func RegisterPeriodicThresholdFunc(name string, period time.Duration, threshold int, check CheckFunc) {
-	DefaultRegistry.RegisterPeriodicThresholdFunc(name, period, threshold, check)
-}
-
 // StatusHandler returns a JSON blob with all the currently registered Health Checks
 // and their corresponding status.
 // Returns 503 if any Error status exists, 200 otherwise
 func StatusHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		checks := CheckStatus()
-		status := http.StatusOK
+		isFailing := false
+		for _, v := range checks {
+			if !v.Healthy {
+				isFailing = true
+			}
+		}
 
-		// If there is an error, return 503
-		if len(checks) != 0 {
+		status := http.StatusOK
+		if isFailing {
+			// If there is an error, return 503
 			status = http.StatusServiceUnavailable
 		}
 
@@ -262,7 +215,15 @@ func StatusHandler(w http.ResponseWriter, r *http.Request) {
 func Handler(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		checks := CheckStatus()
-		if len(checks) != 0 {
+
+		isFailing := false
+		for _, v := range checks {
+			if !v.Healthy {
+				isFailing = true
+			}
+		}
+
+		if isFailing {
 			errcode.ServeJSON(w, errcode.ErrorCodeUnavailable.
 				WithDetail("health check failed: please see /debug/health"))
 			return
@@ -274,7 +235,7 @@ func Handler(handler http.Handler) http.Handler {
 
 // statusResponse completes the request with a response describing the health
 // of the service.
-func statusResponse(w http.ResponseWriter, r *http.Request, status int, checks map[string]string) {
+func statusResponse(w http.ResponseWriter, r *http.Request, status int, checks Status) {
 	p, err := json.Marshal(checks)
 	if err != nil {
 		context.GetLogger(context.Background()).Errorf("error serializing health status: %v", err)
@@ -302,5 +263,4 @@ func statusResponse(w http.ResponseWriter, r *http.Request, status int, checks m
 // Registers global /debug/health api endpoint, creates default registry
 func init() {
 	DefaultRegistry = NewRegistry()
-	http.HandleFunc("/debug/health", StatusHandler)
 }
