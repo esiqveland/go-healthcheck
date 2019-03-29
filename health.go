@@ -3,12 +3,10 @@ package health
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"time"
-
-	"github.com/docker/distribution/context"
-	"github.com/docker/distribution/registry/api/errcode"
 )
 
 // A Registry is a collection of checks. Most applications will use the global
@@ -208,37 +206,12 @@ func StatusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Handler returns a handler that will return 503 response code if the health
-// checks have failed. If everything is okay with the health checks, the
-// handler will pass through to the provided handler. Use this handler to
-// disable a web application when the health checks fail.
-func Handler(handler http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		checks := CheckStatus()
-
-		isFailing := false
-		for _, v := range checks {
-			if !v.Healthy {
-				isFailing = true
-			}
-		}
-
-		if isFailing {
-			errcode.ServeJSON(w, errcode.ErrorCodeUnavailable.
-				WithDetail("health check failed: please see /debug/health"))
-			return
-		}
-
-		handler.ServeHTTP(w, r) // pass through
-	})
-}
-
 // statusResponse completes the request with a response describing the health
 // of the service.
 func statusResponse(w http.ResponseWriter, r *http.Request, status int, checks Status) {
 	p, err := json.Marshal(checks)
 	if err != nil {
-		context.GetLogger(context.Background()).Errorf("error serializing health status: %v", err)
+		log.Printf("error serializing health status: %v", err)
 		p, err = json.Marshal(struct {
 			ServerError string `json:"server_error"`
 		}{
@@ -247,7 +220,7 @@ func statusResponse(w http.ResponseWriter, r *http.Request, status int, checks S
 		status = http.StatusInternalServerError
 
 		if err != nil {
-			context.GetLogger(context.Background()).Errorf("error serializing health status failure message: %v", err)
+			log.Printf("error serializing health status failure message: %v", err)
 			return
 		}
 	}
@@ -256,7 +229,7 @@ func statusResponse(w http.ResponseWriter, r *http.Request, status int, checks S
 	w.Header().Set("Content-Length", fmt.Sprint(len(p)))
 	w.WriteHeader(status)
 	if _, err := w.Write(p); err != nil {
-		context.GetLogger(context.Background()).Errorf("error writing health status response body: %v", err)
+		log.Printf("error writing health status response body: %v", err)
 	}
 }
 
